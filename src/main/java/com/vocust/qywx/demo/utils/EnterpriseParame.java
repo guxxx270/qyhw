@@ -19,9 +19,9 @@ public class EnterpriseParame {
 	public static final String CORPID = "企业微信CORPID";
 	
 	/**
-	 *@desc 企业微信SECRET
+	 *@desc 会话内容存档应用secret
 	 */
-	public static final String SECRET = "企业微信SECRET";
+	public static final String SECRET = "会话内容存档应用SECRET";
 	
 	/**
 	 *@desc 企业微信客户信息获取SECRET

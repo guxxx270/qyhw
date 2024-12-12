@@ -68,39 +68,60 @@ public class QychatServiceImpl implements QychatService {
 	@Scheduled(cron = "0 */5 * * * ?")
 	public void initQychatData() {
 		QueryParam param = new QueryParam();
-		Integer seq = qychatMapper.getSeq() == null ? 0 : qychatMapper.getSeq();// 从第几条开始拉取
-		param.setLimit(100);// 一次拉取多少条消息 最大值为1000
+		// 从第几条开始拉取 表示该企业存档消息序号，该序号单调递增，拉取序号建议设置为上次拉取返回结果中最大序号。首次拉取时seq传0，sdk会返回有效期内最早的消息。
+		Integer seq = qychatMapper.getSeq() == null ? 0 : qychatMapper.getSeq();
+		param.setLimit(100);
 		param.setTimeout(5);
 		int ret = 0;
-		long sdk = Finance.NewSdk();
 
-		// 初始化
-		Finance.Init(sdk, EnterpriseParame.CORPID, EnterpriseParame.SECRET);
+		//使用sdk前需要初始化，初始化成功后的sdk可以一直使用。
+		//如需并发调用sdk，建议每个线程持有一个sdk实例。
+		//初始化时请填入自己企业的corpid与secrectkey。
+		long sdk = Finance.NewSdk();
+		ret = Finance.Init(sdk, EnterpriseParame.CORPID, EnterpriseParame.SECRET);
+		if(ret != 0){
+			Finance.DestroySdk(sdk);
+			System.out.println("init sdk err ret " + ret);
+			return;
+		}
 		int limit = param.getLimit();
+		// 每次使用GetChatData拉取存档前需要调用NewSlice获取一个slice，在使用完slice中数据后，还需要调用FreeSlice释放。
 		long slice = Finance.NewSlice();
+		// proxy与passwd为代理参数，如果运行sdk的环境不能直接访问外网，需要配置代理参数。sdk访问的域名是"https://qyapi.weixin.qq.com"。
 		ret = Finance.GetChatData(sdk, seq, limit, param.getProxy(), param.getPassword(), param.getTimeout(), slice);
 		if (ret != 0) {
-			log.error("getchatdata ret " + ret);
+			log.error("get chatdata ret " + ret);
+			Finance.FreeSlice(slice);
 			return;
 		}
 		// 获取消息
 		String data = Finance.GetContentFromSlice(slice);
-
+		Finance.FreeSlice(slice);
 		JSONObject jsonObject = JSONObject.parseObject(data);
 		ChatDatas cdata = JSON.toJavaObject(jsonObject, ChatDatas.class);
 		List<Qychat> list = cdata.getChatdata();
 		for (Qychat qychat : list) {
-			String msgs = qychat.getEncrypt_chat_msg();
+			//解密会话存档内容
+			//sdk不会要求用户传入rsa私钥，保证用户会话存档数据只有自己能够解密。
+			//此处需要用户先用rsa私钥解密encrypt_random_key后，作为encrypt_key参数传入sdk来解密encrypt_chat_msg获取会话存档明文。
+			String encrypt_chat_msg = qychat.getEncrypt_chat_msg();
 			String encrypt_key = null;
 			try {
 				encrypt_key = RSAUtils.getPrivateKey(qychat.getEncrypt_random_key());
 			} catch (Exception e) {
 				e.printStackTrace();
 			}
-			// 将获取到的数据进行解密操作
+			// 每次使用DecryptData解密会话存档前需要调用NewSlice获取一个slice，在使用完slice中数据后，还需要调用FreeSlice释放。
 			long msg = Finance.NewSlice();
-			Finance.DecryptData(sdk, encrypt_key, msgs, msg);
-			String decrypt_msg = Finance.GetContentFromSlice(msg);// 解密后的消息
+			ret = Finance.DecryptData(sdk, encrypt_key, encrypt_chat_msg, msg);
+			if (ret != 0) {
+				System.out.println("get DecryptData ret " + ret);
+				Finance.FreeSlice(msg);
+				continue;
+			}
+			// 最后得到明文消息内容
+			String decrypt_msg = Finance.GetContentFromSlice(msg);
+			Finance.FreeSlice(msg);
 			qychatMapper.insertQychat(qychat);
 			JSONObject content = JSONObject.parseObject(decrypt_msg);
 			MsgContent msgcontent = new MsgContent();
@@ -144,7 +165,7 @@ public class QychatServiceImpl implements QychatService {
 			// 解析消息 并插入到数据库
 			msgContentMapper.insertMsgContent(msgcontent);
 		}
-		Finance.FreeSlice(slice);
+//		Finance.FreeSlice(slice);
 		log.info("----------------------scheduled tasks qywx data success-----------------------");
 
 	}
@@ -239,9 +260,14 @@ public class QychatServiceImpl implements QychatService {
 		long sdk = Finance.NewSdk();
 		// 初始化
 		Finance.Init(sdk, EnterpriseParame.CORPID, EnterpriseParame.SECRET);
+
+		//媒体文件每次拉取的最大size为512k，因此超过512k的文件需要分片拉取。若该文件未拉取完整，sdk的IsMediaDataFinish接口会返回0，同时通过GetOutIndexBuf接口返回下次拉取需要传入GetMediaData的indexbuf。
+		//indexbuf一般格式如右侧所示，”Range:bytes=524288-1048575“，表示这次拉取的是从524288到1048575的分片。单个文件首次拉取填写的indexbuf为空字符串，拉取后续分片时直接填入上次返回的indexbuf即可。
 		String indexbuf = "";
 		while (true) {
+			// 每次使用GetMediaData拉取存档前需要调用NewMediaData获取一个media_data，在使用完media_data中数据后，还需要调用FreeMediaData释放。
 			long media_data = Finance.NewMediaData();
+			// sdkFileid 解密企微消息的消息体内容中的sdkfileid信息。
 			ret = Finance.GetMediaData(sdk, indexbuf, sdkFileid, null, null, 3, media_data);
 			if (ret != 0) {
 				return;
@@ -250,6 +276,7 @@ public class QychatServiceImpl implements QychatService {
 					Finance.GetIndexLen(media_data), Finance.GetDataLen(media_data),
 					Finance.IsMediaDataFinish(media_data));
 			try {
+				//大于512k的文件会分片拉取，此处需要使用追加写，避免后面的分片覆盖之前的数据。
 				FileOutputStream outputStream = new FileOutputStream(new File(filepath + fileName), true);
 				outputStream.write(Finance.GetData(media_data));
 				outputStream.close();
@@ -257,9 +284,11 @@ public class QychatServiceImpl implements QychatService {
 				e.printStackTrace();
 			}
 			if (Finance.IsMediaDataFinish(media_data) == 1) {
+				//已经拉取完成最后一个分片
 				Finance.FreeMediaData(media_data);
 				break;
 			} else {
+				//获取下次拉取需要使用的indexbuf
 				indexbuf = Finance.GetOutIndexBuf(media_data);
 				Finance.FreeMediaData(media_data);
 			}
